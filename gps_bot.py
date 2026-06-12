@@ -19,7 +19,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 
 # ================== CONFIGURATION ==================
-TELEGRAM_BOT_TOKEN = "7693373495:AAFY8Ni8oiXILW13Nz2K_OD_HjwxbI8Z5ZQ"       # <-- Set your bot token
+TELEGRAM_BOT_TOKEN = "BOT_TOKEN"       # <-- Set your bot token
 YOUR_TELEGRAM_ID = 1977558071                      # <-- Set your Telegram user ID
 FLASK_PORT = "8080"
 USE_CLOUDFLARED = True                            # Set False if you have a public URL already
