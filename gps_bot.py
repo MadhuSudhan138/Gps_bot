@@ -26,7 +26,8 @@ PORT = int(os.environ.get("PORT", 8080))
 # Your Render URL (IMPORTANT: set this!)
 # Format: https://your-app-name.onrender.com
 # You can also set it as an environment variable on Render
-RENDER_URL = https://gps-bot-c8vj.onrender.com
+RENDER_URL = os.environ.get("RENDER_URL", "https://your-app-name.onrender.com")
+
 
 # ================== SETUP ==================
 logging.basicConfig(
