@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 
 # ================== CONFIGURATION ==================
 TELEGRAM_BOT_TOKEN = os.environ.get("YOUR_BOT_TOKEN_HERE")       # <-- Set your bot token
-YOUR_TELEGRAM_ID = os.getenv("YOUR_TELEGRAM_ID")                     # <-- Set your Telegram user ID
+YOUR_TELEGRAM_ID = os.environ.get("YOUR_TELEGRAM_ID")                     # <-- Set your Telegram user ID
 
 # On Render, the PORT is set by the platform
 PORT = int(os.environ.get("PORT", 8080))
