@@ -18,7 +18,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 # If you want ALL users who start the bot to receive updates, leave CHAT_ID empty
 # and we'll collect chat_ids dynamically.
 
-PORT = int(os.environ.get("PORT", 8080)))
+PORT = int(os.environ.get("PORT", 8080))
 
 # Auto-download cloudflared if not present
 import stat
