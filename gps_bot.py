@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify
 import requests
 
 # ========================== CONFIGURATION ==========================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_BOT_TOKEN = os.environ.get("YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 # If you want ALL users who start the bot to receive updates, leave CHAT_ID empty
 # and we'll collect chat_ids dynamically.
